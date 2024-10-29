@@ -1,3 +1,7 @@
+export const experimental = {
+  missingSuspenseWithCSRBailout: false,
+};
+
 export default (phase, { defaultConfig }) => {
   const env = process.env.NODE_ENV;
   /**
@@ -23,3 +27,4 @@ export default (phase, { defaultConfig }) => {
     };
   }
 }
+

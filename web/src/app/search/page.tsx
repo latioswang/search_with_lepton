@@ -3,10 +3,14 @@ import { Result } from "@/app/components/result";
 import { Search } from "@/app/components/search";
 import { Title } from "@/app/components/title";
 import { useSearchParams } from "next/navigation";
-export default function SearchPage() {
+import { Suspense } from "react";
+
+// Create a separate component for the content that uses useSearchParams
+function SearchContent() {
   const searchParams = useSearchParams();
   const query = decodeURIComponent(searchParams.get("q") || "");
   const rid = decodeURIComponent(searchParams.get("rid") || "");
+
   return (
     <div className="absolute inset-0 bg-[url('/ui/bg.svg')]">
       <div className="mx-auto max-w-3xl absolute inset-4 md:inset-8 bg-white">
@@ -23,5 +27,14 @@ export default function SearchPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+// Main page component with Suspense
+export default function SearchPage() {
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <SearchContent />
+    </Suspense>
   );
 }
