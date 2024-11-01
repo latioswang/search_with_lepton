@@ -20,6 +20,10 @@ from leptonai.photon import Photon, StaticFiles
 from leptonai.photon.types import to_bool
 from leptonai.api.v0.workspace import WorkspaceInfoLocalRecord
 from leptonai.util import tool
+from bs4 import BeautifulSoup
+import trafilatura
+import hashlib
+from pathlib import Path
 
 ################################################################################
 # Constant values for the RAG model.
@@ -49,11 +53,26 @@ _default_query = "Who said 'live long and prosper'?"
 # behave differently, and we haven't tuned the prompt to make it optimal - this
 # is left to you, application creators, as an open problem.
 _rag_query_text = """
-You are a large language AI assistant built by Lepton AI. You are given a user question, and please write clean, concise and accurate answer to the question. You will be given a set of related contexts to the question, each starting with a reference number like [[citation:x]], where x is a number. Please use the context and cite the context at the end of each sentence if applicable.
+You are a large language AI assistant for video game recommendations. You are given a user question on game recommendation request, please return in json format and ONLY json the games recommended.
+Example response:
+```json
+{{
+    "games": [
+        {{
+            "name": "The Legend of Zelda: Breath of the Wild",
+            "recommendation": "This is a great game for those who enjoy exploration and puzzle solving in a beautiful open world.",
+        }}
+    ]
+}}
+```
 
-Your answer must be correct, accurate and written by an expert using an unbiased and professional tone. Please limit to 1024 tokens. Do not give any information that is not related to the question, and do not repeat. Say "information is missing on" followed by the related topic, if the given context do not provide sufficient information.
+You will be given a set of related contexts to the question, each starting with a reference number like [[citation:x]], where x is a number. Please use the context and cite the context at the end of each sentence if applicable.
+
+Your answer must be correct, accurate and written by an expert using an unbiased and professional tone. Do not give any information that is not related to the question, and do not repeat.
 
 Please cite the contexts with the reference numbers, in the format [citation:x]. If a sentence comes from multiple contexts, please list all applicable citations, like [citation:3][citation:5]. Other than code and specific names and citations, your answer must be written in the same language as the question.
+
+Each response can contains one or more games (as a list), try to make it 20 if possible, but dont make things up if there's less than 20 recommendations.
 
 Here are the set of contexts:
 
@@ -110,11 +129,20 @@ def search_with_bing(query: str, subscription_key: str):
         raise HTTPException(response.status_code, "Search engine error.")
     json_content = response.json()
     try:
-        contexts = json_content["webPages"]["value"][:REFERENCE_COUNT]
+        raw_contexts = json_content["webPages"]["value"][:REFERENCE_COUNT]
+        contexts = [
+            {
+                "name": c["name"],
+                "url": c["url"],
+                "snippet": c["snippet"],
+                "full_content": extract_webpage_content(c["url"])
+            }
+            for c in raw_contexts
+        ]
+        return contexts
     except KeyError:
         logger.error(f"Error encountered: {json_content}")
         return []
-    return contexts
 
 
 def search_with_google(query: str, subscription_key: str, cx: str):
@@ -288,6 +316,47 @@ def search_with_searchapi(query: str, subscription_key: str):
         logger.error(f"Error encountered: {json_content}")
         return []
 
+def extract_webpage_content(url: str) -> str:
+    # Create cache directory if it doesn't exist
+    cache_dir = Path(".webpage_cache")
+    cache_dir.mkdir(exist_ok=True)
+    
+    # Create cache key from URL using hash to avoid filesystem issues
+    cache_key = hashlib.sha256(url.encode()).hexdigest()
+    cache_file = cache_dir / f"{cache_key}.json"
+    
+    page_size_limit = 1000
+    # Try to load from cache first
+    if cache_file.exists():
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cached_data = json.load(f)
+                if cached_data.get('url') == url:  # Verify URL to avoid hash collisions
+                    # Apply cleanup and length limit after reading from cache
+                    return ' '.join(cached_data['content'].split())[:page_size_limit]
+        except (json.JSONDecodeError, KeyError):
+            # If cache is corrupted, ignore and refetch
+            pass
+    
+    # If not in cache or cache invalid, fetch content
+    try:
+        logger.info(f"Fetching content from {url}")
+        content = trafilatura.fetch_url(url)
+        extracted = trafilatura.extract(content) or ""
+        # Store the full content in cache without length limit
+        cache_data = {
+            'url': url,
+            'content': ' '.join(extracted.split())  # Clean up whitespace before caching
+        }
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False)
+        
+        # Return length-limited version
+        return cache_data['content'][:page_size_limit]
+    except Exception as e:
+        print(f"Error extracting content from {url}: {e}")
+        return ""
+
 class RAG(Photon):
     """
     Retrieval-Augmented Generation Demo from Lepton AI.
@@ -364,15 +433,18 @@ class RAG(Photon):
         try:
             return thread_local.client
         except AttributeError:
-            thread_local.client = openai.OpenAI(
-                base_url=f"https://{self.model}.lepton.run/api/v1/",
-                api_key=os.environ.get("LEPTON_WORKSPACE_TOKEN")
-                or WorkspaceInfoLocalRecord.get_current_workspace_token(),
-                # We will set the connect timeout to be 10 seconds, and read/write
-                # timeout to be 120 seconds, in case the inference server is
-                # overloaded.
-                timeout=httpx.Timeout(connect=10, read=120, write=120, pool=10),
-            )
+            if self.model.startswith("gpt"):
+                thread_local.client = openai.OpenAI(
+                    api_key=os.environ.get("OPENAI_TOKEN"),
+                    timeout=httpx.Timeout(connect=10, read=120, write=120, pool=10),
+                )
+            else:
+                thread_local.client = openai.OpenAI(
+                    base_url=f"https://{self.model}.lepton.run/api/v1/",
+                    api_key=os.environ.get("LEPTON_WORKSPACE_TOKEN")
+                    or WorkspaceInfoLocalRecord.get_current_workspace_token(),
+                    timeout=httpx.Timeout(connect=10, read=120, write=120, pool=10),
+                )
             return thread_local.client
 
     def init(self):
@@ -592,22 +664,60 @@ class RAG(Photon):
 
         system_prompt = _rag_query_text.format(
             context="\n\n".join(
-                [f"[[citation:{i+1}]] {c['snippet']}" for i, c in enumerate(contexts)]
+                [f"[[citation:{i+1}]] {c.get('full_content') or c['snippet']}" for i, c in enumerate(contexts)]
             )
         )
         try:
             client = self.local_client()
+            logger.info(f"LLM system prompt: {system_prompt}")
+            logger.info(f"LLM query: {query}")
             llm_response = client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": query},
                 ],
-                max_tokens=1024,
+                max_tokens=10240,
                 stop=stop_words,
                 stream=True,
                 temperature=0.9,
+                response_format={
+                    "type": "json_object",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "games": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "recommendation": {"type": "string"}
+                                    },
+                                    "required": ["name", "recommendation"]
+                                }
+                            }
+                        },
+                        "required": ["games"]
+                    }
+                }
             )
+            if False: 
+                # Collect the full response from the stream
+                full_response = ""
+                for chunk in llm_response:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        full_response += chunk.choices[0].delta.content
+                
+                # Parse the collected JSON response
+                try:
+                    parsed_response = json.loads(full_response)
+                    logger.info(f"Parsed LLM response: {parsed_response}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse LLM response: {e}\nResponse: {full_response}")
+                    return HTMLResponse("Invalid response format from LLM.", 503)
+
+            logger.info(f"LLM response: {llm_response}")
             if self.should_do_related_questions and generate_related_questions:
                 # While the answer is being generated, we can start generating
                 # related questions as a future.
